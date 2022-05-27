@@ -16,9 +16,8 @@ type conn struct {
 	r    io.Reader
 	w    io.Writer
 
-	rx    chan []byte // channel to read asynchronous
-	tx    chan []byte // channel to write asynchronous
-	txErr chan error
+	rx chan []byte // channel to read asynchronous
+	tx chan []byte // channel to write asynchronous
 
 	once  sync.Once   // Protects closing the connection
 	timer *time.Timer // delays closing the connection too fast (give time to the writer to flush)
