@@ -16,7 +16,9 @@ type conn struct {
 	r    io.Reader
 	w    io.Writer
 
-	rx chan []byte // channel to read asynchronous
+	rx    chan []byte // channel to read asynchronous
+	tx    chan []byte // channel to write asynchronous
+	txErr chan error
 
 	once  sync.Once   // Protects closing the connection
 	timer *time.Timer // delays closing the connection too fast (give time to the writer to flush)
@@ -28,15 +30,19 @@ type conn struct {
 
 func NewConn(r io.Reader, w io.Writer) net.Conn {
 	c := &conn{
-		r:  r,
-		w:  w,
+		r: r,
+		w: w,
+
 		rx: make(chan []byte),
+		tx: make(chan []byte),
 
 		done:          make(chan struct{}),
 		readDeadline:  makeConnDeadline(),
 		writeDeadline: makeConnDeadline(),
 	}
 	go c.asyncRead()
+	go c.asyncWrite()
+
 	return c
 }
 
@@ -57,6 +63,27 @@ func (c *conn) asyncRead() {
 		}
 		if isClosedChan(c.done) {
 			return
+		}
+	}
+}
+
+// async writer to allow cancelling writes
+// without closing the connection.
+func (c *conn) asyncWrite() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case d, ok := <-c.tx:
+			if !ok {
+				c.Close()
+				return
+			}
+			_, err := c.w.Write(d)
+			if err != nil {
+				c.Close()
+				return
+			}
 		}
 	}
 }
@@ -134,35 +161,27 @@ func isClosedChan(c <-chan struct{}) bool {
 
 // Write writes data to the connection
 func (c *conn) Write(data []byte) (int, error) {
-	writeDone := make(chan struct{})
-	var n int
-	var err error
-	go func() {
-		c.wrMu.Lock()
-		defer c.wrMu.Unlock()
+	c.wrMu.Lock()
+	defer c.wrMu.Unlock()
 
-		defer close(writeDone)
-		switch {
-		case isClosedChan(c.done):
-			return
-		case isClosedChan(c.writeDeadline.wait()):
-			return
-		}
-		n, err = c.w.Write(data)
-		if err == nil {
-			c.timer = time.NewTimer(time.Second)
-		}
-	}()
+	switch {
+	case isClosedChan(c.done):
+		return 0, io.ErrClosedPipe
+	case isClosedChan(c.writeDeadline.wait()):
+		return 0, os.ErrDeadlineExceeded
+	}
 
+	buf := make([]byte, len(data))
+	n := copy(buf, data)
 	select {
 	case <-c.done:
 		return 0, io.ErrClosedPipe
-	case <-c.writeDeadline.wait():
+	case <-c.readDeadline.wait():
 		return 0, os.ErrDeadlineExceeded
-	case <-writeDone:
+	case c.tx <- buf:
 	}
-
-	return n, err
+	c.timer = time.NewTimer(500 * time.Millisecond)
+	return n, nil
 }
 
 // Read reads data from the connection
@@ -172,6 +191,13 @@ func (c *conn) Read(data []byte) (int, error) {
 
 	if data == nil {
 		return 0, io.ErrClosedPipe
+	}
+
+	switch {
+	case isClosedChan(c.done):
+		return 0, io.ErrClosedPipe
+	case isClosedChan(c.readDeadline.wait()):
+		return 0, os.ErrDeadlineExceeded
 	}
 
 	select {
@@ -185,8 +211,8 @@ func (c *conn) Read(data []byte) (int, error) {
 		if !ok {
 			return 0, io.EOF
 		}
-		copy(data, d)
-		return len(d), nil
+		n := copy(data, d)
+		return n, nil
 	}
 }
 
