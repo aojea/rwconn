@@ -176,7 +176,7 @@ func (c *conn) Write(data []byte) (int, error) {
 	select {
 	case <-c.done:
 		return 0, io.ErrClosedPipe
-	case <-c.readDeadline.wait():
+	case <-c.writeDeadline.wait():
 		return 0, os.ErrDeadlineExceeded
 	case c.tx <- buf:
 	}
