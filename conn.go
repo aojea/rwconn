@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-var _ net.Conn = (*conn)(nil)
+var _ net.Conn = (*RWConn)(nil)
 
-type conn struct {
+type RWConn struct {
 	wrMu sync.Mutex // guard Write operations
 	rdMu sync.Mutex // guard Read operation
 	r    io.Reader
@@ -21,14 +21,21 @@ type conn struct {
 
 	once  sync.Once   // Protects closing the connection
 	timer *time.Timer // delays closing the connection too fast (give time to the writer to flush)
+	delay time.Duration
 	done  chan struct{}
 
 	readDeadline  *connDeadline
 	writeDeadline *connDeadline
 }
 
-func NewConn(r io.Reader, w io.Writer) net.Conn {
-	c := &conn{
+func SetWriteDelay(t time.Duration) func(*RWConn) {
+	return func(c *RWConn) {
+		c.delay = t
+	}
+}
+
+func NewConn(r io.Reader, w io.Writer, options ...func(*RWConn)) net.Conn {
+	c := &RWConn{
 		r: r,
 		w: w,
 
@@ -36,9 +43,15 @@ func NewConn(r io.Reader, w io.Writer) net.Conn {
 		tx: make(chan []byte),
 
 		done:          make(chan struct{}),
+		delay:         50 * time.Millisecond,
 		readDeadline:  makeConnDeadline(),
 		writeDeadline: makeConnDeadline(),
 	}
+
+	for _, o := range options {
+		o(c)
+	}
+
 	go c.asyncRead()
 	go c.asyncWrite()
 
@@ -47,7 +60,7 @@ func NewConn(r io.Reader, w io.Writer) net.Conn {
 
 // async reader to allow cancelling reads
 // without closing the connection.
-func (c *conn) asyncRead() {
+func (c *RWConn) asyncRead() {
 	buf := make([]byte, 1024)
 	for {
 		n, err := c.r.Read(buf)
@@ -68,7 +81,7 @@ func (c *conn) asyncRead() {
 
 // async writer to allow cancelling writes
 // without closing the connection.
-func (c *conn) asyncWrite() {
+func (c *RWConn) asyncWrite() {
 	for {
 		select {
 		case <-c.done:
@@ -159,7 +172,7 @@ func isClosedChan(c <-chan struct{}) bool {
 }
 
 // Write writes data to the connection
-func (c *conn) Write(data []byte) (int, error) {
+func (c *RWConn) Write(data []byte) (int, error) {
 	c.wrMu.Lock()
 	defer c.wrMu.Unlock()
 
@@ -179,12 +192,14 @@ func (c *conn) Write(data []byte) (int, error) {
 		return 0, os.ErrDeadlineExceeded
 	case c.tx <- buf:
 	}
-	c.timer = time.NewTimer(500 * time.Millisecond)
+	if c.delay > 0 {
+		c.timer = time.NewTimer(c.delay)
+	}
 	return n, nil
 }
 
 // Read reads data from the connection
-func (c *conn) Read(data []byte) (int, error) {
+func (c *RWConn) Read(data []byte) (int, error) {
 	c.rdMu.Lock()
 	defer c.rdMu.Unlock()
 
@@ -216,12 +231,12 @@ func (c *conn) Read(data []byte) (int, error) {
 }
 
 // Close closes the connection
-func (c *conn) Close() error {
+func (c *RWConn) Close() error {
 	c.once.Do(c.close)
 	return nil
 }
 
-func (c *conn) close() {
+func (c *RWConn) close() {
 	if c.timer != nil {
 		<-c.timer.C
 	}
@@ -236,19 +251,19 @@ func (c *conn) close() {
 	close(c.done)
 }
 
-func (c *conn) Done() <-chan struct{} {
+func (c *RWConn) Done() <-chan struct{} {
 	return c.done
 }
 
-func (c *conn) LocalAddr() net.Addr {
+func (c *RWConn) LocalAddr() net.Addr {
 	return connAddr{}
 }
 
-func (c *conn) RemoteAddr() net.Addr {
+func (c *RWConn) RemoteAddr() net.Addr {
 	return connAddr{}
 }
 
-func (c *conn) SetDeadline(t time.Time) error {
+func (c *RWConn) SetDeadline(t time.Time) error {
 	if isClosedChan(c.done) {
 		return io.ErrClosedPipe
 	}
@@ -257,7 +272,7 @@ func (c *conn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *conn) SetWriteDeadline(t time.Time) error {
+func (c *RWConn) SetWriteDeadline(t time.Time) error {
 	if isClosedChan(c.done) {
 		return io.ErrClosedPipe
 	}
@@ -268,7 +283,7 @@ func (c *conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *conn) SetReadDeadline(t time.Time) error {
+func (c *RWConn) SetReadDeadline(t time.Time) error {
 	if isClosedChan(c.done) {
 		return io.ErrClosedPipe
 	}
