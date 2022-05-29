@@ -4,10 +4,13 @@ package rwconn
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -29,7 +32,7 @@ type MakePipe func() (c1, c2 net.Conn, stop func(), err error)
 // false negatives. Thus, some issues may only be detected when the test is
 // run multiple times. For maximal effectiveness, run the tests under the
 // race detector.
-func TestConn(t *testing.T) {
+func TestRWConn(t *testing.T) {
 	mp := func() (c1, c2 net.Conn, stop func(), err error) {
 		pr1, pw1 := io.Pipe()
 		pr2, pw2 := io.Pipe()
@@ -39,6 +42,103 @@ func TestConn(t *testing.T) {
 			c1.Close()
 			c2.Close()
 		}
+		return
+	}
+
+	t.Run("BasicIO", func(t *testing.T) { timeoutWrapper(t, mp, testBasicIO) })
+	t.Run("PingPong", func(t *testing.T) { timeoutWrapper(t, mp, testPingPong) })
+	t.Run("RacyRead", func(t *testing.T) { timeoutWrapper(t, mp, testRacyRead) })
+	t.Run("RacyWrite", func(t *testing.T) { timeoutWrapper(t, mp, testRacyWrite) })
+	t.Run("ReadTimeout", func(t *testing.T) { timeoutWrapper(t, mp, testReadTimeout) })
+	t.Run("PastTimeout", func(t *testing.T) { timeoutWrapper(t, mp, testPastTimeout) })
+	t.Run("WriteTimeout", func(t *testing.T) { timeoutWrapper(t, mp, testWriteTimeout) })
+	t.Run("CloseTimeout", func(t *testing.T) { timeoutWrapper(t, mp, testCloseTimeout) })
+	t.Run("PresentTimeout", func(t *testing.T) { timeoutWrapper(t, mp, testPresentTimeout) })
+	t.Run("FutureTimeout", func(t *testing.T) { timeoutWrapper(t, mp, testFutureTimeout) })
+	t.Run("ConcurrentMethods", func(t *testing.T) { timeoutWrapper(t, mp, testConcurrentMethods) })
+
+}
+
+type flushWrite struct {
+	w    io.Writer
+	f    http.Flusher
+	done chan struct{}
+}
+
+func (w *flushWrite) Write(data []byte) (int, error) {
+	select {
+	case <-w.done:
+	default:
+	}
+	n, err := w.w.Write(data)
+	w.f.Flush()
+	return n, err
+}
+
+func (w *flushWrite) Close() error {
+	select {
+	case <-w.done:
+	default:
+		close(w.done)
+	}
+	return nil
+}
+func (w *flushWrite) Done() chan struct{} {
+	select {
+	case <-w.done:
+	default:
+		w.done = make(chan struct{})
+	}
+	return w.done
+}
+
+func TestHTTPRWConn(t *testing.T) {
+	mp := func() (c1, c2 net.Conn, stop func(), err error) {
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				panic("flusher not support")
+			}
+
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+			fw := &flushWrite{w: w, f: flusher}
+			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond))
+
+			select {
+			case <-r.Context().Done():
+				c2.Close()
+			case <-fw.Done():
+			}
+		}))
+		srv.EnableHTTP2 = true
+		srv.StartTLS()
+
+		pr, pw := io.Pipe()
+		client := srv.Client()
+
+		// Create a request object to send to the server
+		req, err := http.NewRequest(http.MethodGet, srv.URL, pr)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		// Perform the request
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if resp.StatusCode != 200 {
+			return nil, nil, nil, fmt.Errorf("wrong status code")
+		}
+		c1 = NewConn(resp.Body, pw)
+
+		stop = func() {
+			c1.Close()
+			c2.Close()
+			srv.Close()
+		}
+
 		return
 	}
 
