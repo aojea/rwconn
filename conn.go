@@ -1,6 +1,7 @@
 package rwconn
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"os"
@@ -171,10 +172,55 @@ func isClosedChan(c <-chan struct{}) bool {
 	}
 }
 
-// Write writes data to the connection
+// Write data to the connection in fixed chunks of 1024
 func (c *RWConn) Write(data []byte) (int, error) {
 	c.wrMu.Lock()
 	defer c.wrMu.Unlock()
+
+	switch {
+	case isClosedChan(c.done):
+		return 0, io.ErrClosedPipe
+	case isClosedChan(c.writeDeadline.wait()):
+		return 0, os.ErrDeadlineExceeded
+	}
+	// write in chunks of 1024 bytes to avoid exceeding the maximum packet size
+	// on the underline writer.
+	buf := make([]byte, 1024)
+	r := bytes.NewReader(data)
+	var err error
+	var written int
+	for {
+		nr, er := r.Read(buf)
+		if nr > 0 {
+			nw, ew := c.write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = io.ErrShortWrite
+				}
+			}
+			written += nw
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
+// write writes data to the connection
+func (c *RWConn) write(data []byte) (int, error) {
 
 	switch {
 	case isClosedChan(c.done):
