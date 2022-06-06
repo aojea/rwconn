@@ -25,6 +25,8 @@ type RWConn struct {
 	delay time.Duration
 	done  chan struct{}
 
+	closeFn func() // called only once when closing the connection
+
 	readDeadline  *connDeadline
 	writeDeadline *connDeadline
 }
@@ -32,6 +34,12 @@ type RWConn struct {
 func SetWriteDelay(t time.Duration) func(*RWConn) {
 	return func(c *RWConn) {
 		c.delay = t
+	}
+}
+
+func SetCloseHook(f func()) func(*RWConn) {
+	return func(c *RWConn) {
+		c.closeFn = f
 	}
 }
 
@@ -283,15 +291,22 @@ func (c *RWConn) Close() error {
 }
 
 func (c *RWConn) close() {
+	// wait for the write delay interval set
 	if c.timer != nil {
 		<-c.timer.C
 	}
+
 	if readerCloser, ok := c.r.(io.Closer); ok {
 		readerCloser.Close()
 	}
 
 	if writerCloser, ok := c.w.(io.Closer); ok {
 		writerCloser.Close()
+	}
+
+	// execute configured hook
+	if c.closeFn != nil {
+		c.closeFn()
 	}
 
 	close(c.done)
