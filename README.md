@@ -99,26 +99,26 @@ func connHandler(w http.ResponseWriter, r *http.Request) {
 ### Client
 
 ```go
-		pr, pw := io.Pipe()
-		client := srv.Client()
+pr, pw := io.Pipe()
+client := srv.Client()
 
-		// Create a request object to send to the server
-		req, err := http.NewRequest(http.MethodGet, srv.URL, pr)
-		if err != nil {
-			return nil, nil, nil, err
-		}
+// Create a request object to send to the server
+req, err := http.NewRequest(http.MethodGet, srv.URL, pr)
+if err != nil {
+	return nil, nil, nil, err
+}
 
-		// Perform the request
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		if resp.StatusCode != 200 {
-			return nil, nil, nil, fmt.Errorf("wrong status code")
-		}
-		c := NewConn(resp.Body, pw)
-    // manage connection
-    // ...
+// Perform the request
+resp, err := client.Do(req)
+if err != nil {
+	return nil, nil, nil, err
+}
+if resp.StatusCode != 200 {
+	return nil, nil, nil, fmt.Errorf("wrong status code")
+}
+c := NewConn(resp.Body, pw)
+// manage connection
+// ...
 ```
 
 
