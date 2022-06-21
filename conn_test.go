@@ -84,11 +84,6 @@ func (w *flushWrite) Close() error {
 	return nil
 }
 func (w *flushWrite) Done() chan struct{} {
-	select {
-	case <-w.done:
-	default:
-		w.done = make(chan struct{})
-	}
 	return w.done
 }
 
@@ -102,7 +97,7 @@ func TestHTTPRWConn(t *testing.T) {
 
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
-			fw := &flushWrite{w: w, f: flusher}
+			fw := &flushWrite{w: w, f: flusher, done: make(chan struct{})}
 			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond))
 
 			select {
