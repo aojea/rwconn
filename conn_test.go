@@ -60,36 +60,40 @@ func TestRWConn(t *testing.T) {
 }
 
 type flushWrite struct {
-	w    io.Writer
-	f    http.Flusher
-	done chan struct{}
+	mu     sync.Mutex
+	w      io.Writer
+	f      http.Flusher
+	closed bool
 }
 
 func (w *flushWrite) Write(data []byte) (int, error) {
-	select {
-	case <-w.done:
-	default:
+	if w.isClosed() {
+		return 0, nil
 	}
 	n, err := w.w.Write(data)
-	w.f.Flush()
+	if err == nil && !w.isClosed() {
+		w.f.Flush()
+	}
 	return n, err
 }
 
 func (w *flushWrite) Close() error {
-	select {
-	case <-w.done:
-	default:
-		close(w.done)
-	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
 	return nil
 }
-func (w *flushWrite) Done() chan struct{} {
-	return w.done
+
+func (w *flushWrite) isClosed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
 }
 
 func TestHTTPRWConn(t *testing.T) {
 	mp := func() (c1, c2 net.Conn, stop func(), err error) {
 		readyCh := make(chan struct{})
+
 		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			flusher, ok := w.(http.Flusher)
 			if !ok {
@@ -98,14 +102,19 @@ func TestHTTPRWConn(t *testing.T) {
 
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
-			fw := &flushWrite{w: w, f: flusher, done: make(chan struct{})}
-			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond))
+			fw := &flushWrite{w: w, f: flusher}
+			defer fw.Close()
+			doneCh := make(chan struct{})
+			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond), SetCloseHook(func() {
+				// stop the flusher
+				fw.Close()
+				// exit the handler
+				close(doneCh)
+			}))
+			// signal connection is ready
 			close(readyCh)
-			select {
-			case <-r.Context().Done():
-				c2.Close()
-			case <-fw.Done():
-			}
+			// wait until the connection is closed to stop the handler
+			<-doneCh
 		}))
 		srv.EnableHTTP2 = true
 		srv.StartTLS()
