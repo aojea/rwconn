@@ -22,7 +22,8 @@ type RWConn struct {
 
 	once sync.Once // Protects closing the connection
 
-	lastWrite time.Time // timestamp last write was done
+	delayMu   sync.Mutex // guard delay operations
+	lastWrite time.Time  // timestamp last write was done
 	delay     time.Duration
 
 	done chan struct{}
@@ -226,9 +227,11 @@ func (c *RWConn) Write(data []byte) (int, error) {
 			break
 		}
 	}
+	c.delayMu.Lock()
 	if c.delay > 0 {
 		c.lastWrite = time.Now()
 	}
+	c.delayMu.Unlock()
 	return written, err
 }
 
@@ -294,14 +297,14 @@ func (c *RWConn) Close() error {
 
 func (c *RWConn) close() {
 	// wait for the write delay interval set
-	c.wrMu.Lock()
+	c.delayMu.Lock()
 	if c.delay > 0 {
 		// wait the configured delay - the time since last writes
 		if wait := c.delay - time.Now().Sub(c.lastWrite); wait > 0 {
 			time.Sleep(wait)
 		}
 	}
-	c.wrMu.Unlock()
+	c.delayMu.Unlock()
 
 	if readerCloser, ok := c.r.(io.Closer); ok {
 		readerCloser.Close()
