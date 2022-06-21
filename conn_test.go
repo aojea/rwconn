@@ -89,6 +89,7 @@ func (w *flushWrite) Done() chan struct{} {
 
 func TestHTTPRWConn(t *testing.T) {
 	mp := func() (c1, c2 net.Conn, stop func(), err error) {
+		readyCh := make(chan struct{})
 		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			flusher, ok := w.(http.Flusher)
 			if !ok {
@@ -99,7 +100,7 @@ func TestHTTPRWConn(t *testing.T) {
 			flusher.Flush()
 			fw := &flushWrite{w: w, f: flusher, done: make(chan struct{})}
 			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond))
-
+			close(readyCh)
 			select {
 			case <-r.Context().Done():
 				c2.Close()
@@ -127,12 +128,12 @@ func TestHTTPRWConn(t *testing.T) {
 			return nil, nil, nil, fmt.Errorf("wrong status code")
 		}
 		c1 = NewConn(resp.Body, pw)
-
 		stop = func() {
 			c1.Close()
 			c2.Close()
 			srv.Close()
 		}
+		<-readyCh
 
 		return
 	}
