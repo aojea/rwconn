@@ -20,10 +20,12 @@ type RWConn struct {
 	rx chan []byte // channel to read asynchronous
 	tx chan []byte // channel to write asynchronous
 
-	once  sync.Once   // Protects closing the connection
-	timer *time.Timer // delays closing the connection too fast (give time to the writer to flush)
-	delay time.Duration
-	done  chan struct{}
+	once sync.Once // Protects closing the connection
+
+	lastWrite time.Time // timestamp last write was done
+	delay     time.Duration
+
+	done chan struct{}
 
 	closeFn func() // called only once when closing the connection
 
@@ -224,6 +226,9 @@ func (c *RWConn) Write(data []byte) (int, error) {
 			break
 		}
 	}
+	if c.delay > 0 {
+		c.lastWrite = time.Now()
+	}
 	return written, err
 }
 
@@ -245,9 +250,6 @@ func (c *RWConn) write(data []byte) (int, error) {
 	case <-c.writeDeadline.wait():
 		return 0, os.ErrDeadlineExceeded
 	case c.tx <- buf:
-	}
-	if c.delay > 0 {
-		c.timer = time.NewTimer(c.delay)
 	}
 	return n, nil
 }
@@ -292,9 +294,14 @@ func (c *RWConn) Close() error {
 
 func (c *RWConn) close() {
 	// wait for the write delay interval set
-	if c.timer != nil {
-		<-c.timer.C
+	c.wrMu.Lock()
+	if c.delay > 0 {
+		// wait the configured delay - the time since last writes
+		if wait := c.delay - time.Now().Sub(c.lastWrite); wait > 0 {
+			time.Sleep(wait)
+		}
 	}
+	c.wrMu.Unlock()
 
 	if readerCloser, ok := c.r.(io.Closer); ok {
 		readerCloser.Close()
