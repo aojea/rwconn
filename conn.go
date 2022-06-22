@@ -101,8 +101,7 @@ func (c *RWConn) Write(data []byte) (int, error) {
 	case isClosedChan(c.writeDeadline.wait()):
 		return 0, os.ErrDeadlineExceeded
 	}
-	// write in chunks of 1024 bytes to avoid exceeding the maximum packet size
-	// on the underline writer.
+
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	r := bytes.NewReader(buf)
