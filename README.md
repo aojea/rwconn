@@ -40,59 +40,40 @@ This module was created specifically to create connections over HTTP, those can 
 ```go
 // flushWriter
 type flushWrite struct {
-	w    io.Writer
-	f    http.Flusher
-	done chan struct{}
+	w io.Writer
+	f http.Flusher
 }
 
 func (w *flushWrite) Write(data []byte) (int, error) {
-	select {
-	case <-w.done:
-	default:
-	}
 	n, err := w.w.Write(data)
 	w.f.Flush()
 	return n, err
 }
 
 func (w *flushWrite) Close() error {
-	select {
-	case <-w.done:
-	default:
-		close(w.done)
-	}
 	return nil
 }
-func (w *flushWrite) Done() chan struct{} {
-	select {
-	case <-w.done:
-	default:
-		w.done = make(chan struct{})
-	}
-	return w.done
-}
+
 
 // handler to create a connection
 func connHandler(w http.ResponseWriter, r *http.Request) {
 			flusher, ok := w.(http.Flusher)
 			if !ok {
-				panic("flusher not supported")
+				panic("flusher not support")
 			}
 
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
 			fw := &flushWrite{w: w, f: flusher}
-			c := NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond))
-      
-      // handle the connection
-      // go handleConn(c)
-
-      // block until the connection is closed
-			select {
-			case <-r.Context().Done():
-				c.Close()
-			case <-fw.Done():
-			}
+			doneCh := make(chan struct{})
+			c2 = NewConn(r.Body, fw, SetWriteDelay(50*time.Millisecond), SetCloseHook(func() {
+				// exit the handler
+				close(doneCh)
+			}))
+			// signal connection is ready
+			close(readyCh)
+			// wait until the connection is closed to stop the handler
+			<-doneCh
 }
 ```
 
@@ -100,7 +81,7 @@ func connHandler(w http.ResponseWriter, r *http.Request) {
 
 ```go
 pr, pw := io.Pipe()
-client := srv.Client()
+client := &http.Client{}
 
 // Create a request object to send to the server
 req, err := http.NewRequest(http.MethodGet, srv.URL, pr)

@@ -60,34 +60,18 @@ func TestRWConn(t *testing.T) {
 }
 
 type flushWrite struct {
-	mu     sync.Mutex
-	w      io.Writer
-	f      http.Flusher
-	closed bool
+	w io.Writer
+	f http.Flusher
 }
 
 func (w *flushWrite) Write(data []byte) (int, error) {
-	if w.isClosed() {
-		return 0, nil
-	}
 	n, err := w.w.Write(data)
-	if err == nil && !w.isClosed() {
-		w.f.Flush()
-	}
+	w.f.Flush()
 	return n, err
 }
 
 func (w *flushWrite) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.closed = true
 	return nil
-}
-
-func (w *flushWrite) isClosed() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.closed
 }
 
 func TestHTTPRWConn(t *testing.T) {
@@ -103,11 +87,8 @@ func TestHTTPRWConn(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
 			fw := &flushWrite{w: w, f: flusher}
-			defer fw.Close()
 			doneCh := make(chan struct{})
-			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond), SetCloseHook(func() {
-				// stop the flusher
-				fw.Close()
+			c2 = NewConn(r.Body, fw, SetCloseHook(func() {
 				// exit the handler
 				close(doneCh)
 			}))
