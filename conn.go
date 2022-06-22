@@ -18,7 +18,6 @@ type RWConn struct {
 	w    io.Writer
 
 	rx chan []byte // channel to read asynchronous
-	tx chan []byte // channel to write asynchronous
 
 	once sync.Once // Protects closing the connection
 
@@ -48,12 +47,9 @@ func SetCloseHook(f func()) func(*RWConn) {
 
 func NewConn(r io.Reader, w io.Writer, options ...func(*RWConn)) net.Conn {
 	c := &RWConn{
-		r: r,
-		w: w,
-
-		rx: make(chan []byte),
-		tx: make(chan []byte),
-
+		r:             r,
+		w:             w,
+		rx:            make(chan []byte),
 		done:          make(chan struct{}),
 		delay:         50 * time.Millisecond,
 		readDeadline:  makeConnDeadline(),
@@ -65,7 +61,6 @@ func NewConn(r io.Reader, w io.Writer, options ...func(*RWConn)) net.Conn {
 	}
 
 	go c.asyncRead()
-	go c.asyncWrite()
 
 	return c
 }
@@ -79,7 +74,11 @@ func (c *RWConn) asyncRead() {
 		if n > 0 {
 			tmp := make([]byte, n)
 			copy(tmp, buf[:n])
-			c.rx <- tmp
+			select {
+			case <-c.done:
+				return
+			case c.rx <- tmp:
+			}
 		}
 		if err != nil {
 			c.Close()
@@ -91,25 +90,112 @@ func (c *RWConn) asyncRead() {
 	}
 }
 
-// async writer to allow cancelling writes
-// without closing the connection.
-func (c *RWConn) asyncWrite() {
-	for {
-		select {
-		case <-c.done:
-			return
-		case d, ok := <-c.tx:
-			if !ok {
-				c.Close()
-				return
-			}
-			_, err := c.w.Write(d)
-			if err != nil {
-				c.Close()
-				return
-			}
+// Write data to the connection in fixed chunks of 1024
+func (c *RWConn) Write(data []byte) (int, error) {
+	c.wrMu.Lock()
+	defer c.wrMu.Unlock()
+
+	switch {
+	case isClosedChan(c.done):
+		return 0, io.ErrClosedPipe
+	case isClosedChan(c.writeDeadline.wait()):
+		return 0, os.ErrDeadlineExceeded
+	}
+	// write in chunks of 1024 bytes to avoid exceeding the maximum packet size
+	// on the underline writer.
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	r := bytes.NewReader(buf)
+	var err error
+	var written int64
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		written, err = io.Copy(c.w, r)
+	}()
+
+	select {
+	case <-c.done:
+		return 0, io.ErrClosedPipe
+	case <-c.writeDeadline.wait():
+		return 0, os.ErrDeadlineExceeded
+	case <-doneCh:
+	}
+
+	c.delayMu.Lock()
+	if c.delay > 0 {
+		c.lastWrite = time.Now()
+	}
+	c.delayMu.Unlock()
+	return int(written), err
+}
+
+// Read reads data from the connection
+func (c *RWConn) Read(data []byte) (int, error) {
+	c.rdMu.Lock()
+	defer c.rdMu.Unlock()
+
+	if data == nil {
+		return 0, io.ErrClosedPipe
+	}
+
+	switch {
+	case isClosedChan(c.done):
+		return 0, io.ErrClosedPipe
+	case isClosedChan(c.readDeadline.wait()):
+		return 0, os.ErrDeadlineExceeded
+	}
+
+	select {
+	case <-c.done:
+		// TODO: TestConn/BasicIO the other end stops writing and the http connection is closed
+		// closing this connection that is blocked on read.
+		return 0, io.EOF
+	case <-c.readDeadline.wait():
+		return 0, os.ErrDeadlineExceeded
+	case d, ok := <-c.rx:
+		if !ok {
+			return 0, io.EOF
+		}
+		n := copy(data, d)
+		return n, nil
+	}
+}
+
+// Close closes the connection
+func (c *RWConn) Close() error {
+	c.once.Do(c.close)
+	return nil
+}
+
+func (c *RWConn) close() {
+	// wait for the write delay interval set
+	c.delayMu.Lock()
+	if c.delay > 0 {
+		// wait the configured delay - the time since last writes
+		if wait := c.delay - time.Now().Sub(c.lastWrite); wait > 0 {
+			time.Sleep(wait)
 		}
 	}
+	c.delayMu.Unlock()
+
+	if readerCloser, ok := c.r.(io.Closer); ok {
+		readerCloser.Close()
+	}
+
+	if writerCloser, ok := c.w.(io.Closer); ok {
+		writerCloser.Close()
+	}
+
+	// execute configured hook
+	if c.closeFn != nil {
+		c.closeFn()
+	}
+	close(c.done)
+}
+
+func (c *RWConn) Done() <-chan struct{} {
+	return c.done
 }
 
 // connection parameters (obtained from net.Pipe)
@@ -183,157 +269,6 @@ func isClosedChan(c <-chan struct{}) bool {
 	}
 }
 
-// Write data to the connection in fixed chunks of 1024
-func (c *RWConn) Write(data []byte) (int, error) {
-	c.wrMu.Lock()
-	defer c.wrMu.Unlock()
-
-	switch {
-	case isClosedChan(c.done):
-		return 0, io.ErrClosedPipe
-	case isClosedChan(c.writeDeadline.wait()):
-		return 0, os.ErrDeadlineExceeded
-	}
-	// write in chunks of 1024 bytes to avoid exceeding the maximum packet size
-	// on the underline writer.
-	buf := make([]byte, 1024)
-	r := bytes.NewReader(data)
-	var err error
-	var written int
-	for {
-		nr, er := r.Read(buf)
-		if nr > 0 {
-			nw, ew := c.write(buf[0:nr])
-			if nw < 0 || nr < nw {
-				nw = 0
-				if ew == nil {
-					ew = io.ErrShortWrite
-				}
-			}
-			written += nw
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-	c.delayMu.Lock()
-	if c.delay > 0 {
-		c.lastWrite = time.Now()
-	}
-	c.delayMu.Unlock()
-	return written, err
-}
-
-// write writes data to the connection
-func (c *RWConn) write(data []byte) (int, error) {
-
-	switch {
-	case isClosedChan(c.done):
-		return 0, io.ErrClosedPipe
-	case isClosedChan(c.writeDeadline.wait()):
-		return 0, os.ErrDeadlineExceeded
-	}
-
-	buf := make([]byte, len(data))
-	n := copy(buf, data)
-	select {
-	case <-c.done:
-		return 0, io.ErrClosedPipe
-	case <-c.writeDeadline.wait():
-		return 0, os.ErrDeadlineExceeded
-	case c.tx <- buf:
-	}
-	return n, nil
-}
-
-// Read reads data from the connection
-func (c *RWConn) Read(data []byte) (int, error) {
-	c.rdMu.Lock()
-	defer c.rdMu.Unlock()
-
-	if data == nil {
-		return 0, io.ErrClosedPipe
-	}
-
-	switch {
-	case isClosedChan(c.done):
-		return 0, io.ErrClosedPipe
-	case isClosedChan(c.readDeadline.wait()):
-		return 0, os.ErrDeadlineExceeded
-	}
-
-	select {
-	case <-c.done:
-		// TODO: TestConn/BasicIO the other end stops writing and the http connection is closed
-		// closing this connection that is blocked on read.
-		return 0, io.EOF
-	case <-c.readDeadline.wait():
-		return 0, os.ErrDeadlineExceeded
-	case d, ok := <-c.rx:
-		if !ok {
-			return 0, io.EOF
-		}
-		n := copy(data, d)
-		return n, nil
-	}
-}
-
-// Close closes the connection
-func (c *RWConn) Close() error {
-	c.once.Do(c.close)
-	return nil
-}
-
-func (c *RWConn) close() {
-	// wait for the write delay interval set
-	c.delayMu.Lock()
-	if c.delay > 0 {
-		// wait the configured delay - the time since last writes
-		if wait := c.delay - time.Now().Sub(c.lastWrite); wait > 0 {
-			time.Sleep(wait)
-		}
-	}
-	c.delayMu.Unlock()
-
-	if readerCloser, ok := c.r.(io.Closer); ok {
-		readerCloser.Close()
-	}
-
-	if writerCloser, ok := c.w.(io.Closer); ok {
-		writerCloser.Close()
-	}
-
-	// execute configured hook
-	if c.closeFn != nil {
-		c.closeFn()
-	}
-
-	close(c.done)
-}
-
-func (c *RWConn) Done() <-chan struct{} {
-	return c.done
-}
-
-func (c *RWConn) LocalAddr() net.Addr {
-	return connAddr{}
-}
-
-func (c *RWConn) RemoteAddr() net.Addr {
-	return connAddr{}
-}
-
 func (c *RWConn) SetDeadline(t time.Time) error {
 	if isClosedChan(c.done) {
 		return io.ErrClosedPipe
@@ -369,3 +304,11 @@ type connAddr struct{}
 
 func (connAddr) Network() string { return "rwconn" }
 func (connAddr) String() string  { return "rwconn" }
+
+func (c *RWConn) LocalAddr() net.Addr {
+	return connAddr{}
+}
+
+func (c *RWConn) RemoteAddr() net.Addr {
+	return connAddr{}
+}
