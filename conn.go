@@ -164,6 +164,9 @@ func (c *RWConn) Read(data []byte) (int, error) {
 
 // Close closes the connection
 func (c *RWConn) Close() error {
+	// wait for the writes to finish
+	c.wrMu.Lock()
+	defer c.wrMu.Unlock()
 	c.once.Do(c.close)
 	return nil
 }
