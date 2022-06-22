@@ -88,7 +88,7 @@ func TestHTTPRWConn(t *testing.T) {
 			flusher.Flush()
 			fw := &flushWrite{w: w, f: flusher}
 			doneCh := make(chan struct{})
-			c2 = NewConn(r.Body, fw, SetCloseHook(func() {
+			c2 = NewConn(r.Body, fw, SetWriteDelay(500*time.Millisecond), SetCloseHook(func() {
 				// exit the handler
 				close(doneCh)
 			}))
