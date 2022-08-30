@@ -81,6 +81,7 @@ func (c *RWConn) asyncRead() {
 			}
 		}
 		if err != nil {
+			close(c.rx)
 			c.Close()
 			return
 		}
@@ -140,16 +141,14 @@ func (c *RWConn) Read(data []byte) (int, error) {
 
 	switch {
 	case isClosedChan(c.done):
-		return 0, io.ErrClosedPipe
+		return 0, io.EOF
 	case isClosedChan(c.readDeadline.wait()):
 		return 0, os.ErrDeadlineExceeded
 	}
 
 	select {
 	case <-c.done:
-		// TODO: TestConn/BasicIO the other end stops writing and the http connection is closed
-		// closing this connection that is blocked on read.
-		return 0, io.EOF
+		return 0, io.ErrClosedPipe
 	case <-c.readDeadline.wait():
 		return 0, os.ErrDeadlineExceeded
 	case d, ok := <-c.rx:
